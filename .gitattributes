@@ -1,0 +1,6 @@
+# GIT ATTRIBUTES FILE.
+
+*.bat -crlf
+*.dsp -crlf
+
+
