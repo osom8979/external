@@ -29,11 +29,9 @@ typedef struct {
 } Shortcut;
 
 typedef struct {
-	uint mod;
-	uint button;
-	void (*func)(const Arg *);
-	const Arg arg;
-	uint  release;
+	uint b;
+	uint mask;
+	char *s;
 } MouseShortcut;
 
 typedef struct {
@@ -58,7 +56,6 @@ static void selpaste(const Arg *);
 static void zoom(const Arg *);
 static void zoomabs(const Arg *);
 static void zoomreset(const Arg *);
-static void ttysend(const Arg *);
 
 /* config.h for applying patches and the configuration. */
 #include "config.h"
@@ -94,12 +91,8 @@ typedef struct {
 	Drawable buf;
 	GlyphFontSpec *specbuf; /* font spec buffer used for rendering */
 	Atom xembed, wmdeletewin, netwmname, netwmpid;
-	struct {
-		XIM xim;
-		XIC xic;
-		XPoint spot;
-		XVaNestedList spotlist;
-	} ime;
+	XIM xim;
+	XIC xic;
 	Draw draw;
 	Visual *vis;
 	XSetWindowAttributes attrs;
@@ -146,10 +139,6 @@ static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
 static void xdrawglyph(Glyph, int, int);
 static void xclear(int, int, int, int);
 static int xgeommasktogravity(int);
-static int ximopen(Display *);
-static void ximinstantiate(Display *, XPointer, XPointer);
-static void ximdestroy(XIM, XPointer, XPointer);
-static int xicdestroy(XIC, XPointer, XPointer);
 static void xinit(int, int);
 static void cresize(int, int);
 static void xresize(int, int);
@@ -171,7 +160,6 @@ static void kpress(XEvent *);
 static void cmessage(XEvent *);
 static void resize(XEvent *);
 static void focus(XEvent *);
-static int mouseaction(XEvent *, uint);
 static void brelease(XEvent *);
 static void bpress(XEvent *);
 static void bmotion(XEvent *);
@@ -235,9 +223,8 @@ typedef struct {
 } Fontcache;
 
 /* Fontcache is an array now. A new font will be appended to the array. */
-static Fontcache *frc = NULL;
+static Fontcache frc[16];
 static int frclen = 0;
-static int frccap = 0;
 static char *usedfont = NULL;
 static double usedfontsize = 0;
 static double defaultfontsize = 0;
@@ -321,12 +308,6 @@ zoomreset(const Arg *arg)
 	}
 }
 
-void
-ttysend(const Arg *arg)
-{
-	ttywrite(arg->s, strlen(arg->s), 1);
-}
-
 int
 evcol(XEvent *e)
 {
@@ -347,7 +328,7 @@ void
 mousesel(XEvent *e, int done)
 {
 	int type, seltype = SEL_REGULAR;
-	uint state = e->xbutton.state & ~(Button1Mask | forcemousemod);
+	uint state = e->xbutton.state & ~(Button1Mask | forceselmod);
 
 	for (type = 1; type < LEN(selmasks); ++type) {
 		if (match(selmasks[type], state)) {
@@ -423,37 +404,25 @@ mousereport(XEvent *e)
 	ttywrite(buf, len, 0);
 }
 
-int
-mouseaction(XEvent *e, uint release)
-{
-	MouseShortcut *ms;
-
-	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
-		if (ms->release == release &&
-		    ms->button == e->xbutton.button &&
-		    (match(ms->mod, e->xbutton.state) ||  /* exact or forced */
-		     match(ms->mod, e->xbutton.state & ~forcemousemod))) {
-			ms->func(&(ms->arg));
-			return 1;
-		}
-	}
-
-	return 0;
-}
-
 void
 bpress(XEvent *e)
 {
 	struct timespec now;
+	MouseShortcut *ms;
 	int snap;
 
-	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forceselmod)) {
 		mousereport(e);
 		return;
 	}
 
-	if (mouseaction(e, 0))
-		return;
+	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
+		if (e->xbutton.button == ms->b
+				&& match(ms->mask, e->xbutton.state)) {
+			ttywrite(ms->s, strlen(ms->s), 1);
+			return;
+		}
+	}
 
 	if (e->xbutton.button == Button1) {
 		/*
@@ -669,21 +638,21 @@ xsetsel(char *str)
 void
 brelease(XEvent *e)
 {
-	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forceselmod)) {
 		mousereport(e);
 		return;
 	}
 
-	if (mouseaction(e, 1))
-		return;
-	if (e->xbutton.button == Button1)
+	if (e->xbutton.button == Button2)
+		selpaste(NULL);
+	else if (e->xbutton.button == Button1)
 		mousesel(e, 1);
 }
 
 void
 bmotion(XEvent *e)
 {
-	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
+	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forceselmod)) {
 		mousereport(e);
 		return;
 	}
@@ -789,6 +758,7 @@ xsetcolorname(int x, const char *name)
 
 	if (!BETWEEN(x, 0, dc.collen))
 		return 1;
+
 
 	if (!xloadcolor(x, name, &ncolor))
 		return 1;
@@ -1026,60 +996,6 @@ xunloadfonts(void)
 	xunloadfont(&dc.ibfont);
 }
 
-int
-ximopen(Display *dpy)
-{
-	XIMCallback imdestroy = { .client_data = NULL, .callback = ximdestroy };
-	XICCallback icdestroy = { .client_data = NULL, .callback = xicdestroy };
-
-	xw.ime.xim = XOpenIM(xw.dpy, NULL, NULL, NULL);
-	if (xw.ime.xim == NULL)
-		return 0;
-
-	if (XSetIMValues(xw.ime.xim, XNDestroyCallback, &imdestroy, NULL))
-		fprintf(stderr, "XSetIMValues: "
-		                "Could not set XNDestroyCallback.\n");
-
-	xw.ime.spotlist = XVaCreateNestedList(0, XNSpotLocation, &xw.ime.spot,
-	                                      NULL);
-
-	if (xw.ime.xic == NULL) {
-		xw.ime.xic = XCreateIC(xw.ime.xim, XNInputStyle,
-		                       XIMPreeditNothing | XIMStatusNothing,
-		                       XNClientWindow, xw.win,
-		                       XNDestroyCallback, &icdestroy,
-		                       NULL);
-	}
-	if (xw.ime.xic == NULL)
-		fprintf(stderr, "XCreateIC: Could not create input context.\n");
-
-	return 1;
-}
-
-void
-ximinstantiate(Display *dpy, XPointer client, XPointer call)
-{
-	if (ximopen(dpy))
-		XUnregisterIMInstantiateCallback(xw.dpy, NULL, NULL, NULL,
-		                                 ximinstantiate, NULL);
-}
-
-void
-ximdestroy(XIM xim, XPointer client, XPointer call)
-{
-	xw.ime.xim = NULL;
-	XRegisterIMInstantiateCallback(xw.dpy, NULL, NULL, NULL,
-	                               ximinstantiate, NULL);
-	XFree(xw.ime.spotlist);
-}
-
-int
-xicdestroy(XIC xim, XPointer client, XPointer call)
-{
-	xw.ime.xic = NULL;
-	return 1;
-}
-
 void
 xinit(int cols, int rows)
 {
@@ -1117,7 +1033,7 @@ xinit(int cols, int rows)
 	xw.attrs.background_pixel = dc.col[defaultbg].pixel;
 	xw.attrs.border_pixel = dc.col[defaultbg].pixel;
 	xw.attrs.bit_gravity = NorthWestGravity;
-	xw.attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask
+	xw.attrs.event_mask = FocusChangeMask | KeyPressMask
 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
 		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
 	xw.attrs.colormap = xw.cmap;
@@ -1145,10 +1061,22 @@ xinit(int cols, int rows)
 	xw.draw = XftDrawCreate(xw.dpy, xw.buf, xw.vis, xw.cmap);
 
 	/* input methods */
-	if (!ximopen(xw.dpy)) {
-		XRegisterIMInstantiateCallback(xw.dpy, NULL, NULL, NULL,
-	                                       ximinstantiate, NULL);
+	if ((xw.xim = XOpenIM(xw.dpy, NULL, NULL, NULL)) == NULL) {
+		XSetLocaleModifiers("@im=local");
+		if ((xw.xim =  XOpenIM(xw.dpy, NULL, NULL, NULL)) == NULL) {
+			XSetLocaleModifiers("@im=");
+			if ((xw.xim = XOpenIM(xw.dpy,
+					NULL, NULL, NULL)) == NULL) {
+				die("XOpenIM failed. Could not open input"
+					" device.\n");
+			}
+		}
 	}
+	xw.xic = XCreateIC(xw.xim, XNInputStyle, XIMPreeditNothing
+					   | XIMStatusNothing, XNClientWindow, xw.win,
+					   XNFocusWindow, xw.win, NULL);
+	if (xw.xic == NULL)
+		die("XCreateIC failed. Could not obtain input method.\n");
 
 	/* white cursor, black outline */
 	cursor = XCreateFontCursor(xw.dpy, mouseshape);
@@ -1179,8 +1107,8 @@ xinit(int cols, int rows)
 
 	win.mode = MODE_NUMLOCK;
 	resettitle();
-	xhints();
 	XMapWindow(xw.dpy, xw.win);
+	xhints();
 	XSync(xw.dpy, False);
 
 	clock_gettime(CLOCK_MONOTONIC, &xsel.tclick1);
@@ -1290,10 +1218,13 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			fontpattern = FcFontSetMatch(0, fcsets, 1,
 					fcpattern, &fcres);
 
-			/* Allocate memory for the new cache entry. */
-			if (frclen >= frccap) {
-				frccap += 16;
-				frc = xrealloc(frc, frccap * sizeof(Fontcache));
+			/*
+			 * Overwrite or create the new cache entry.
+			 */
+			if (frclen >= LEN(frc)) {
+				frclen = LEN(frc) - 1;
+				XftFontClose(xw.dpy, frc[frclen].font);
+				frc[frclen].unicodep = 0;
 			}
 
 			frc[frclen].font = XftFontOpenPattern(xw.dpy,
@@ -1624,18 +1555,6 @@ xfinishdraw(void)
 }
 
 void
-xximspot(int x, int y)
-{
-	if (xw.ime.xic == NULL)
-		return;
-
-	xw.ime.spot.x = borderpx + x * win.cw;
-	xw.ime.spot.y = borderpx + (y + 1) * win.ch;
-
-	XSetICValues(xw.ime.xic, XNPreeditAttributes, xw.ime.spotlist, NULL);
-}
-
-void
 expose(XEvent *ev)
 {
 	redraw();
@@ -1709,15 +1628,13 @@ focus(XEvent *ev)
 		return;
 
 	if (ev->type == FocusIn) {
-		if (xw.ime.xic)
-			XSetICFocus(xw.ime.xic);
+		XSetICFocus(xw.xic);
 		win.mode |= MODE_FOCUSED;
 		xseturgency(0);
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[I", 3, 0);
 	} else {
-		if (xw.ime.xic)
-			XUnsetICFocus(xw.ime.xic);
+		XUnsetICFocus(xw.xic);
 		win.mode &= ~MODE_FOCUSED;
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[O", 3, 0);
@@ -1772,7 +1689,7 @@ kpress(XEvent *ev)
 {
 	XKeyEvent *e = &ev->xkey;
 	KeySym ksym;
-	char buf[64], *customkey;
+	char buf[32], *customkey;
 	int len;
 	Rune c;
 	Status status;
@@ -1781,10 +1698,7 @@ kpress(XEvent *ev)
 	if (IS_SET(MODE_KBDLOCK))
 		return;
 
-	if (xw.ime.xic)
-		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
-	else
-		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
+	len = XmbLookupString(xw.xic, e, buf, sizeof buf, &ksym, &status);
 	/* 1. shortcuts */
 	for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
 		if (ksym == bp->keysym && match(bp->mod, e->state)) {
@@ -1816,6 +1730,7 @@ kpress(XEvent *ev)
 	}
 	ttywrite(buf, len, 1);
 }
+
 
 void
 cmessage(XEvent *e)

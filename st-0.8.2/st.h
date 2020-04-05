@@ -74,7 +74,6 @@ typedef union {
 	uint ui;
 	float f;
 	const void *v;
-	const char *s;
 } Arg;
 
 void die(const char *, ...);
@@ -115,7 +114,7 @@ char *xstrdup(char *);
 extern char *utmp;
 extern char *stty_args;
 extern char *vtiden;
-extern wchar_t *worddelimiters;
+extern char *worddelimiters;
 extern int allowaltscreen;
 extern char *termname;
 extern unsigned int tabspaces;
